@@ -1,0 +1,211 @@
+---
+
+- name: Playbook para la unión de un Ubuntu Desktop a un servidor Zentyal
+  hosts: linux-clients
+  vars:
+    - domain_name: "lab.lan"
+    - domain_admin: "admindc"
+    - domain_admin_password: "P@ssw0rd!"
+    - domain_user: "djoven"
+
+  tasks:
+    - name: Comprobando que el hostname esté en el mismo dominio
+      fail:
+        msg: "El hostname de la máquina no está en el mismo dominio."
+      when: "ansible_fqdn is search('ansible_hostname.domain_name')"
+
+    - name: Realizando una consulta DNS al dominio
+      shell: "dig +noall +comments +answer {{ domain_name }} | egrep 'status.*,' -o | sed 's/,//'"
+      register: query_domain
+
+    - name: Comprobando la resolución del dominio
+      assert:
+        that:
+          - "query_domain.stdout is match('.*NOERROR.*')"
+        success_msg: "Dominio resuelto correctamente."
+        fail_msg: "Dominio no resuelto. El motivo es: {{ query_domain.stdout }} ."
+
+    - name: Realizando una consulta DNS al registro LDAP del dominio
+      shell: "dig SRV +short _ldap._tcp.{{ domain_name }}"
+      register: query_ldap
+
+    - name: Comprobando la resolución de la consulta
+      assert:
+        that:
+          - "query_ldap.stdout is match('.*389.*{{ domain_name }}.*')"
+        success_msg: "Consulta resuelta correctamente."
+        fail_msg: "Consulta no resuelta. El motivo es: {{ query_ldap.stdout }} ."
+
+    - name: Eliminando los paquetes que se necesitarán para la unión del cliente
+      apt:
+        name:
+          - samba
+          - winbind
+          - sssd
+        state: absent
+        force_apt_get: yes
+
+    - name: Copiando el archivo de configuración de Kerberos
+      template:
+        src: krb5.conf.j2
+        dest: /etc/krb5.conf
+        owner: root
+        group: root
+        mode: 0640
+
+    - name: Instalando los paquetes necesarios para la unión del cliente al dominio
+      apt:
+        name:
+          - samba
+          - attr
+          - krb5-config
+          - krb5-user
+          - winbind
+          - libpam-winbind
+          - libnss-winbind
+          - python-pexpect
+        state: latest
+        force_apt_get: yes
+
+    - name: Copiando el archivo de configuración de Samba
+      template:
+        src: smb.conf.j2
+        dest: /etc/samba/smb.conf
+        owner: root
+        group: root
+        mode: 0640
+        backup: true
+
+    - name: Parando y deshabilitando uno de los demonios de Samba que no se usará
+      systemd:
+        name: samba-ad-dc
+        state: stopped
+        enabled: false
+        masked: true
+
+    - name: Iniciando y reiniciando los demonios de Samba que se usarán
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+        enabled: true
+      with_items:
+        - "smbd"
+        - "nmbd"
+
+    - name: Obteniendo un ticket de Kerberos para comprobar su funcionamiento
+      expect:
+        command: "kinit {{ domain_admin }}"
+        responses:
+          (?i)password: "{{ domain_admin_password }}"
+
+    - name: Uniendo el equipo al dominio
+      shell: "net ads join -U{{ domain_admin }}%{{ domain_admin_password }}"
+      register: machine_join
+
+    - name: Comprobando que la unión haya sido satisfactorio
+      assert:
+        that:
+          - "machine_join.stdout_lines[1] is match('.*Joined.*')"
+        success_msg: "Equipo correctamente unido al dominio."
+        fail_msg: "No se ha podido unir al dominio. El error ha sido: {{ machine_join.stdout }} ."
+
+    - name: Modificando el NSSWITCH para la autenticación local de los usuarios del dominio
+      replace:
+        path: /etc/nsswitch.conf
+        regexp: "{{ item.key }}" 
+        replace: "{{ item.value }}"
+        backup: true
+      with_items:
+        - { key: "^passwd:.*compat", value: "passwd:\t\tcompat winbind" }
+        - { key: "^group:.*compat", value: "group:\t\tcompat winbind" }
+
+    - name: Habilitando y reiniciando el demonio Winbind
+      systemd:
+        name: winbind
+        state: restarted
+        enabled: true   
+
+    - name: Probando la conectividad con el dominio vía Winbind
+      shell: wbinfo --ping-dc
+      register: winbind_ping
+
+    - name: Comprobando el resultado de la conectividad vía Winbind
+      assert:
+        that:
+          - "winbind_ping.stdout is match('.*{{ domain_name }}.*succeeded')"
+        success_msg: "Conectividad vía Winbind correcta"
+        fail_msg: "No hay conectividad con Winbind. El error es: {{ winbind_ping.stdout }} ."
+
+    - name: Obteniendo información sobre los usuarios del dominio con Winbind
+      shell: wbinfo -u | wc -l
+      register: winbind_users
+
+    - name: Comprobando el resultado de la los usuarios
+      assert:
+        that:
+          - "winbind_users.stdout > 4"
+        success_msg: "Se ha obtenido información de los usuarios."
+        fail_msg: "No se ha podido obtener información sobre los usuarios. El error es: {{ winbind_users.stdout }} ."
+
+    - name: Obteniendo información sobre los grupos del dominio con Winbind
+      shell: wbinfo -g | wc -l
+      register: winbind_groups
+
+    - name: Comprobando el resultado de la los usuarios
+      assert:
+        that:
+          - "winbind_groups.stdout > 5"
+        success_msg: "Se ha obtenido información de los grupos."
+        fail_msg: "No se ha podido obtener información sobre los ugrupos. El error es: {{ winbind_groups.stdout }} ."
+
+    - name: Comprobando que los usuarios del dominio están disponibles localmente
+      shell: getent passwd "{{ domain_user }}"
+      register: get_user
+
+    - name: Comprobando que el usuario consultado pertece al dominio
+      assert:
+        that:
+          - "get_user.stdout is match('^{{ domain_user }}.*{{ domain_name.split(\'.\')[0] | upper }}/{{ domain_user }}.*')"
+        success_msg: "Se ha obtenido la información del usuario del dominio."
+        fail_msg: "La información obtenida del usuario indica que es local. Saliendo."
+    
+    - name: Activando el PAM 
+      lineinfile:
+        path: /etc/pam.d/common-session
+        regexp: "^session.optional.*pam_mkhomedir.so*"
+        line: "session optional\t\t pam_mkhomedir.so"
+        backup: yes
+
+    - name: Habilitando el login de usuarios no listados en Ubuntu
+      lineinfile:
+        path: /usr/share/lightdm/lightdm.conf.d/50-ubuntu.conf
+        regexp: "{{ item.key }}"
+        line: "{{ item.value }}"
+        state: present
+        backup: yes
+      with_items:
+        - { key: "greeter-show-manual-login.*", value: "greeter-show-manual-login=true" }
+        - { key: "greeter-hide-users.*", value: "greeter-hide-users=true" }
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Habilitando el login de usuarios no listados en Linux Mint
+      lineinfile:
+        path: /etc/lightdm/lightdm.conf.d/70-linuxmint.conf
+        regexp: "{{ item.key }}"
+        line: "{{ item.value }}"
+        state: present
+        backup: yes
+      with_items:
+        - { key: "greeter-show-manual-login.*", value: "greeter-show-manual-login=true" }
+        - { key: "greeter-hide-users.*", value: "greeter-hide-users=true" }
+      when: ansible_distribution == 'Linux Mint'
+
+    - name: Reiniciando el servidor para aplicar los todos cambios
+      reboot:
+        reboot_timeout: 360
+    
+    - name: Mensaje final
+      debug:
+        msg: "Deploy completado con éxito."
+
+...
